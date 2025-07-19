@@ -1,0 +1,173 @@
+version: '3.8'
+
+services:
+  # Primary PostgreSQL instance with extensions
+  postgres-primary:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-primary
+    environment:
+      POSTGRES_DB: mastery_lab
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: replicator_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./scripts/init:/docker-entrypoint-initdb.d
+      - ./scripts/postgresql.conf:/etc/postgresql/postgresql.conf
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c log_statement=all
+      -c log_destination=stderr
+      -c logging_collector=on
+      -c log_directory=/var/log/postgresql
+      -c log_filename=postgresql.log
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Read replica for scaling exercises
+  postgres-replica:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-replica
+    environment:
+      POSTGRES_USER: replicator
+      POSTGRES_PASSWORD: replicator_password
+      PGUSER: replicator
+      POSTGRES_DB: mastery_lab
+      POSTGRES_MASTER_SERVICE: postgres-primary
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./scripts/setup-replica.sh:/docker-entrypoint-initdb.d/setup-replica.sh
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    networks:
+      - postgres_network
+    command: >
+      bash -c "
+      pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U replicator -v -P
+      echo 'standby_mode = on' >> /var/lib/postgresql/data/postgresql.conf
+      echo \"primary_conninfo = 'host=postgres-primary port=5432 user=replicator'\" >> /var/lib/postgresql/data/postgresql.conf
+      postgres
+      "
+
+  # Redis for caching exercises
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - postgres_network
+    command: redis-server --appendonly yes
+
+  # pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@masterylab.com
+      PGADMIN_DEFAULT_PASSWORD: admin_password
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8080:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./scripts/pgadmin-servers.json:/pgadmin4/servers.json
+    depends_on:
+      - postgres-primary
+    networks:
+      - postgres_network
+
+  # Grafana for monitoring exercises
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: grafana_password
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - postgres_network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    networks:
+      - postgres_network
+
+  # PostgreSQL Exporter for metrics
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:postgres_password@postgres-primary:5432/mastery_lab?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres-primary
+    networks:
+      - postgres_network
+
+  # Application server for API exercises
+  api-server:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    container_name: api-server
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres_password@postgres-primary:5432/mastery_lab
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src:/app
+      - /app/node_modules
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - postgres_network
+    command: npm run dev
+
+volumes:
+  postgres_primary_data:
+  postgres_replica_data:
+  redis_data:
+  pgadmin_data:
+  grafana_data:
+  prometheus_data:
+
+networks:
+  postgres_network:
+    driver: bridge
